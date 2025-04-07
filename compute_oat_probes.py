@@ -6,20 +6,18 @@ import random
 import warnings
 from typing import Literal
 
-warnings.filterwarnings("ignore")  # Suppress all other warnings
-os.environ["TRANSFORMERS_VERBOSITY"] = "error"  # Suppress transformer warnings
+# suppress all warnings and transformer messages
+warnings.filterwarnings("ignore")
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 import numpy as np
 
-# Third-party library imports
 import torch
 from torch import nn
 from datasets import load_dataset
 from src.probe_training import *
 
-# Local imports
 from src import *
-from src.encoders import LlamaModelLoader, GemmaModelLoader, QwenCoderLoader
 
 
 def parse_args():
@@ -45,13 +43,6 @@ def parse_args():
         action="store_true",
         help="Disable LoRA probes (enabled by default)",
     )
-    parser.add_argument(
-        "--model-type",
-        type=str,
-        choices=["llama3", "gemma2", "qwen2.5"],
-        default="gemma2",
-        help="Type of model to use",
-    )
     return parser.parse_args()
 
 
@@ -73,10 +64,9 @@ def get_probe_creator(probe_type: Literal["linear", "nonlinear"]):
 def sample_examples_from_datasets(
     datasets, proportions, total_examples=1000, only_prompts=False
 ):
-    # This function samples examples from multiple datasets, ensuring that the final list has the desired proportions
-    # of examples from each dataset. The final list is shuffled.
+    # samples examples from datasets according to given proportions and shuffles the result
 
-    # Ensure the proportions sum to 1
+    # ensure datasets and proportions match and sum to 1
     if len(datasets) != len(proportions):
         raise ValueError("Number of datasets must match number of proportions")
 
@@ -106,7 +96,7 @@ def sample_examples_from_datasets(
 
 
 def split_dataset(dataset, train_ratio=0.9, val_ratio=0.1, test_ratio=0.0):
-    # Function to split dataset into train, validation, and test sets
+    # splits dataset into train, validation, and test sets according to provided ratios
     assert (
         abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6
     ), "Ratios must sum to 1"
@@ -122,7 +112,7 @@ def split_dataset(dataset, train_ratio=0.9, val_ratio=0.1, test_ratio=0.0):
 
     return train_set, val_set, test_set
 
-
+# # llama3
 # def is_token_after_assistant(seq_idx, token, tokens):
 #     ASSISTANT_TOKEN = 78191
 #     return seq_idx >= 1 and tokens[seq_idx - 1] == ASSISTANT_TOKEN
@@ -184,45 +174,19 @@ def split_dataset(dataset, train_ratio=0.9, val_ratio=0.1, test_ratio=0.0):
 #     else:
 #         raise ValueError(f"Unknown masking_type: {masking_type}")
 
-# Model-specific tokenizer constants
-# These should ideally be looked up dynamically from the tokenizer
+# USER_TOKEN = 882          # 'user'
+# ASSISTANT_TOKEN = 78191   # 'model'
+# START_OF_TURN_TOKEN = 128000  # <start_of_turn>
+# END_OF_TURN_TOKEN   = 128009  # <end_of_turn>
+# NEWLINE_TOKEN       = 271  # If your tokenizer truly uses 271 for '\n'
 
-# Model token mapping
-TOKEN_MAPPING = {
-    "llama3": {
-        "USER_TOKEN": 882,         # 'user'
-        "ASSISTANT_TOKEN": 78191,  # 'model'
-        "START_OF_TURN_TOKEN": 128000, # <start_of_turn>
-        "END_OF_TURN_TOKEN": 128009,   # <end_of_turn>
-        "NEWLINE_TOKEN": 271,      # '\n'
-    },
-    "gemma2": {
-        "USER_TOKEN": 1645,        # 'user'
-        "ASSISTANT_TOKEN": 2516,   # 'model'
-        "START_OF_TURN_TOKEN": 106,  # <start_of_turn>
-        "END_OF_TURN_TOKEN": 107,    # <end_of_turn>
-        "NEWLINE_TOKEN": 108,        # '\n'
-    },
-    "qwen2.5": {
-        # Placeholder for Qwen 2.5 token IDs
-        # Will be filled in later with actual values
-        "USER_TOKEN": 0,           # TBD
-        "ASSISTANT_TOKEN": 0,      # TBD
-        "START_OF_TURN_TOKEN": 0,  # TBD
-        "END_OF_TURN_TOKEN": 0,    # TBD
-        "NEWLINE_TOKEN": 0,        # TBD
-    }
-}
+# gemma2
+USER_TOKEN = 1645
+ASSISTANT_TOKEN = 2516
+START_OF_TURN_TOKEN = 106  # <start_of_turn>
+END_OF_TURN_TOKEN = 107    # <end_of_turn>
+NEWLINE_TOKEN = 108        # newline character
 
-# Using Gemma2 tokens as default for now
-# This should be changed based on the model_type
-USER_TOKEN = TOKEN_MAPPING["gemma2"]["USER_TOKEN"]
-ASSISTANT_TOKEN = TOKEN_MAPPING["gemma2"]["ASSISTANT_TOKEN"]
-START_OF_TURN_TOKEN = TOKEN_MAPPING["gemma2"]["START_OF_TURN_TOKEN"]
-END_OF_TURN_TOKEN = TOKEN_MAPPING["gemma2"]["END_OF_TURN_TOKEN"]
-NEWLINE_TOKEN = TOKEN_MAPPING["gemma2"]["NEWLINE_TOKEN"]
-
-# Example: "token is after assistant if the previous token == ASSISTANT_TOKEN"
 def is_token_after_assistant(seq_idx, token, tokens):
     return seq_idx >= 2 and tokens[seq_idx - 1] == ASSISTANT_TOKEN and tokens[seq_idx - 2] == START_OF_TURN_TOKEN
 
@@ -248,13 +212,8 @@ def is_at_token_after_newline(seq_idx, token, tokens):
 
 
 def get_token_ranges(masking_type):
-    """
-    This is your original structure, but with the old 128000/128009 replaced
-    by <start_of_turn> = 106 and <end_of_turn> = 107.
-
-    You can tweak which functions or IDs define start/end, depending on
-    whether "instruction" or "generation" means user vs. assistant tokens.
-    """
+    # defines token range masks for different masking types (instruction vs generation)
+    # returns dictionaries of functions and tokens that define specific ranges
 
     INSTRUCTION_START = START_OF_TURN_TOKEN
     INSTRUCTION_END   = END_OF_TURN_TOKEN
@@ -301,56 +260,27 @@ def get_token_ranges(masking_type):
 
 def main():
     global encoder
-    global USER_TOKEN, ASSISTANT_TOKEN, START_OF_TURN_TOKEN, END_OF_TURN_TOKEN, NEWLINE_TOKEN
-    
+
     args = parse_args()
     probes_folder = "./probe_weights_comp_only"
-    model_type = args.model_type
+    model_type = "gemma2"
     masking_type = args.masking_type
     use_lora_probes = not args.no_lora_probes
     name = f"{model_type}_lora_oat_{masking_type}_{'nonlinear' if args.probe_type == 'nonlinear' else 'linear'}"
 
     os.makedirs(probes_folder, exist_ok=True)
-    
-    # Update token constants based on selected model
-    if model_type in TOKEN_MAPPING:
-        tokens = TOKEN_MAPPING[model_type]
-        USER_TOKEN = tokens["USER_TOKEN"]
-        ASSISTANT_TOKEN = tokens["ASSISTANT_TOKEN"]
-        START_OF_TURN_TOKEN = tokens["START_OF_TURN_TOKEN"]
-        END_OF_TURN_TOKEN = tokens["END_OF_TURN_TOKEN"]
-        NEWLINE_TOKEN = tokens["NEWLINE_TOKEN"]
-        print(f"Using token mapping for model: {model_type}")
-    else:
-        print(f"Warning: No token mapping defined for model type: {model_type}")
-        print("Using default token mapping (gemma2)")
 
     # Load model and dataset
     if model_type == "llama3":
-        encoder = LlamaModelLoader.load_llama3_model(instruct=True)
+        encoder = EleutherSparseAutoencoder.load_llama3_sae(None, instruct=True)
         jailbreaks_dataset = load_dataset(
             "Mechanistic-Anomaly-Detection/llama3-jailbreaks"
         )
     elif model_type == "gemma2":
-        encoder = GemmaModelLoader.load_gemma2_model(instruct=True)
+        encoder = DeepmindSparseAutoencoder.load_gemma2_sae(None, 11)
         jailbreaks_dataset = load_dataset(
             "Mechanistic-Anomaly-Detection/gemma2-jailbreaks"
         )
-    elif model_type == "qwen2.5":
-        encoder = QwenCoderLoader.load_qwen_coder(
-            model_name="Qwen/Qwen2.5-Coder-7B-Instruct",
-            device="cuda",
-            trust_remote_code=True,
-            load_in_8bit=False  # or True if you want
-        )
-        jailbreaks_dataset = load_dataset(
-            "Mechanistic-Anomaly-Detection/qwen25-jailbreaks"
-        )
-
-    # encoder contains tokenizer and the model:
-    # self.model = model
-    # self.tokenizer = tokenizer
-
 
     forget_examples_train = sample_examples_from_datasets(
         [jailbreaks_dataset["circuit_breakers_train"]], [1.0]
@@ -371,9 +301,6 @@ def main():
         [0.15, 0.85],
         only_prompts=True,
     )
-
-    # somewhere here we can also get the 1% FPR threshold value
-    # that can be used for the system with the probe
 
     # Train/test split
     forget_examples_train, forget_examples_val, _ = split_dataset(forget_examples_train)

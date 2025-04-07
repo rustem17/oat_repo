@@ -7,27 +7,16 @@ import argparse
 from tqdm import tqdm
 from datasets import load_dataset
 
-# -- LLaMA local model imports & setup ----------------------------------------
 import torch
 from huggingface_hub import snapshot_download
 from peft import PeftModel
 from src import EleutherSparseAutoencoder, load_probes  # Adjust if needed
 
-# -----------------------------------------------------------------------------
-
 
 def load_local_llama_model(baseline=False):
-    """
-    Loads the local LLaMA-based model.
-    If baseline is False, we load the modified LLaMA model (merging LoRA adapters);
-    if baseline is True, we load a baseline model without merging LoRA (or any modifications).
-    Returns: (encoder) which includes a .model and a .tokenizer.
-    """
     if baseline:
         print("Loading baseline LLaMA 3 model locally...")
-        # For your baseline, you might wish to load without any modifications.
         encoder = EleutherSparseAutoencoder.load_llama3_sae(None, instruct=True)
-        # Optionally: perform any baseline-specific post-processing here.
         print("Baseline model and tokenizer ready.")
         return encoder
     else:
@@ -43,7 +32,6 @@ def load_local_llama_model(baseline=False):
             local_dir=local_dir,
         )
 
-        # If not already a PeftModel, merge LoRA adapters.
         if not isinstance(encoder.model, PeftModel):
             print("Merging LoRA adapters...")
             encoder.model = PeftModel.from_pretrained(encoder.model, local_dir)
@@ -56,17 +44,6 @@ def load_local_llama_model(baseline=False):
 
 
 def generate_local_llama_response(encoder, prompt_text):
-    """
-    Generates a response from the local LLaMA model using your
-    instructed chat template and a fixed 'assistant' generation style.
-
-    Args:
-      encoder: the object returned by load_local_llama_model()
-      prompt_text: string containing the question or combined instruction.
-
-    Returns:
-      A string containing the model's decoded text output.
-    """
     tokens = encoder.tokenizer.apply_chat_template(
         [{"content": prompt_text, "role": "user"}],
         add_generation_prompt=True,
@@ -99,7 +76,6 @@ def generate_local_llama_response_with_mask(encoder, prompt_text):
         if tokens.dim() == 1:
             tokens = tokens.unsqueeze(0)
 
-    # Prepare input_ids and (if available) attention_mask.
     if isinstance(tokens, dict):
         input_ids = tokens.get("input_ids")
         attention_mask = tokens.get("attention_mask")
@@ -125,7 +101,6 @@ def generate_local_llama_response_with_mask(encoder, prompt_text):
     return decoded
 
 
-# -- MMLU-Pro evaluation code ------------------------------------------------
 def load_mmlu_pro():
     dataset = load_dataset("TIGER-Lab/MMLU-Pro")
     test_df, val_df = dataset["test"], dataset["validation"]
@@ -135,10 +110,6 @@ def load_mmlu_pro():
 
 
 def preprocess(split_data):
-    """
-    Reformat the MMLU-Pro data so we can index it by category.
-    Removes any 'N/A' option from the options array.
-    """
     res_df = []
     for each in split_data:
         options = [opt for opt in each["options"] if opt != "N/A"]
@@ -153,11 +124,6 @@ def preprocess(split_data):
 
 
 def extract_answer(text):
-    """
-    Attempts to extract an answer A-J from the LLaMA output
-    by matching patterns like:
-      'the answer is (X)' or 'Answer: X' or final mention of A-J
-    """
     pattern = r"answer is \(?([A-J])\)?"
     match = re.search(pattern, text, re.IGNORECASE)
     if match:
@@ -185,12 +151,6 @@ def extract_final(text):
 
 
 def single_request(encoder, single_question, dev_examples_dict, exist_result):
-    """
-    For a single question without chain-of-thought examples, we:
-      1) Check if result already cached in exist_result.
-      2) Build a simpler prompt that directly asks for the final answer.
-      3) Call the local LLaMA model and extract the predicted option.
-    """
     q_id = single_question["question_id"]
     for each in exist_result:
         if q_id == each["question_id"] and single_question["question"] == each["question"]:
@@ -201,7 +161,6 @@ def single_request(encoder, single_question, dev_examples_dict, exist_result):
     question = single_question["question"]
     options = single_question["options"]
 
-    # Build a simplified prompt without chain-of-thought examples:
     prompt = ("You will be given a multiple choice question about {}. "
               "Provide the final answer in the format: \"The answer is (X)\".\n\n").format(category)
 
@@ -225,10 +184,6 @@ def single_request(encoder, single_question, dev_examples_dict, exist_result):
 
 
 def update_result(output_res_path):
-    """
-    Loads existing results from output_res_path and calculates the
-    per-category stats. Returns (res_list, category_record).
-    """
     category_record = {}
     res = []
     success = False
@@ -262,10 +217,6 @@ def update_result(output_res_path):
 
 
 def merge_result(res, curr):
-    """
-    Merges the current question's result into the overall res array
-    to avoid duplication. If question_id is found, update it; else append.
-    """
     merged = False
     for i, single in enumerate(res):
         if (single["question_id"] == curr["question_id"]
@@ -279,9 +230,6 @@ def merge_result(res, curr):
 
 
 def save_res(res, output_res_path):
-    """
-    Cleans duplicates and saves result JSON.
-    """
     temp = []
     exist_q_id = []
     for each in res:
@@ -293,9 +241,6 @@ def save_res(res, output_res_path):
 
 
 def save_summary(category_record, output_summary_path):
-    """
-    Computes overall accuracy and per-category accuracy, then writes JSON summary.
-    """
     total_corr = 0.0
     total_wrong = 0.0
     for cat, stats in category_record.items():
@@ -312,11 +257,6 @@ def save_summary(category_record, output_summary_path):
 
 
 def evaluate(encoder, subjects, output_dir, baseline=False):
-    """
-    The main evaluation loop. Goes through each subject in MMLU-Pro test set,
-    uses the dev set for few-shot, calls local LLaMA, extracts the answer,
-    and saves the results incrementally.
-    """
     test_df, dev_df = load_mmlu_pro()
 
     if not subjects:
@@ -363,7 +303,6 @@ def evaluate(encoder, subjects, output_dir, baseline=False):
         save_summary(category_record, output_summary_path)
 
 
-# -- Main script entry point --------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     os.makedirs("eval_results_mmlu", exist_ok=True)
@@ -380,7 +319,6 @@ if __name__ == "__main__":
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load your local LLaMA model
     encoder = load_local_llama_model(baseline=True)
 
     # Run the MMLU-Pro evaluation

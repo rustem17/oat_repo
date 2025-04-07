@@ -6,393 +6,47 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import numpy as np
 import torch
-import torch.multiprocessing as mp
 import torch.nn.functional as F
-from peft import LoraConfig, PeftModel, get_peft_model
+from peft import LoraConfig, get_peft_model
 from torch import nn
 from tqdm.auto import tqdm
 import wandb
 
-from .attacks import *
 from .utils import convert_seconds_to_time_str, get_valid_token_mask
+from .attacks import train_attack, benchmark_obfuscated_softprompt
 
 
 class Probe(nn.Module):
-    # Base class for all probes
-
     def __init__(self):
         super().__init__()
 
     def forward(self, x):
-        # assert x.dim() == 3, "Input must be of shape (batch_size, seq_len, d_model)"
+        # implements a forward pass through the probe
         raise NotImplementedError
 
     def compute_loss(self, acts, labels, mask=None):
-        # acts should be of shape (d1, d2, ..., dn, d_model)
-        # labels should be of shape (d1, d2, ..., dn)
-        # where d1, d2, ..., dn are the batch dimensions
+        # computes loss between probe outputs and labels
+        # acts: shape (d1, d2, ..., dn, d_model) - model activations
+        # labels: shape (d1, d2, ..., dn) - binary labels
+        # mask: optional boolean mask for selecting positions
 
         logits = self.forward(acts)
 
-        # Handle masking
         if mask is not None:
-            # Ensure mask shape matches logits shape
             if mask.shape != logits.shape:
-                # If mask is flattened, reshape it to match logits
                 mask = mask.view(logits.shape)
 
-            # Apply mask
             logits = logits[mask]
             labels = labels[mask]
 
-        # Compute BCE loss
+        # BCE loss
         labels = labels.to(dtype=logits.dtype)
         return F.binary_cross_entropy_with_logits(logits, labels, reduction="mean")
 
     def predict(self, x):
         # x should be of shape (d1, d2, ..., dn, d_model)
         # should return a tensor of shape (d1, d2, ..., dn)
-        # All returned values should be between 0 and 1
         return torch.sigmoid(self.forward(x))
-
-
-def initialize_probes_and_optimizers(
-    layers, create_probe_fn, lr, device, pretrained_probes=None
-):
-    # Initialize probes and their corresponding optimizers for each layer
-    if pretrained_probes is not None:
-        print("Using pretrained probes...")
-        probes = pretrained_probes
-    else:
-        probes = {layer: create_probe_fn() for layer in layers}
-    optimizers = {
-        layer: torch.optim.AdamW(probe.parameters(), lr=lr)
-        for layer, probe in probes.items()
-    }
-    return probes, optimizers
-
-
-def train_layer(
-    layer,
-    probe,
-    optimizer,
-    pos_activations,
-    neg_activations,
-    n_epochs,
-    batch_size,
-    n_grad_accum,
-    device,
-    using_memmap,
-    clip_grad_norm=1.0,
-):
-    # Train a probe on the activations at a specific layer
-    probe.to(device)
-    n_examples = min(len(pos_activations), len(neg_activations))
-    total_losses = []
-
-    for epoch in tqdm(range(n_epochs)):
-
-        # Shuffle the activations every epoch
-        epoch_loss = 0
-        shuffle_indices = np.random.permutation(n_examples)
-        pos_activations_shuffled = pos_activations[shuffle_indices]
-        neg_activations_shuffled = neg_activations[shuffle_indices]
-
-        for i in range(0, n_examples, batch_size):
-
-            # Drop last batch if it is smaller than batch_size
-            if i + batch_size > n_examples:
-                break
-
-            # Train the probe on the batch of activations
-            with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                probe.train()
-
-                # Load the batch onto the device, and create masks for zero padding
-                if not using_memmap:
-                    pos_batch = pos_activations_shuffled[i : i + batch_size].to(device)
-                    neg_batch = neg_activations_shuffled[i : i + batch_size].to(device)
-                else:
-                    pos_batch = torch.from_numpy(
-                        pos_activations_shuffled[i : i + batch_size]
-                    ).to(device)
-                    neg_batch = torch.from_numpy(
-                        neg_activations_shuffled[i : i + batch_size]
-                    ).to(device)
-                zero_mask_pos = torch.all(pos_batch == 0, dim=-1).view(-1).to(device)
-                zero_mask_neg = torch.all(neg_batch == 0, dim=-1).view(-1).to(device)
-
-                # Forward pass through the probe, and compute the loss
-                pos_targets = torch.ones_like(pos_batch[..., 0], device=device)
-                neg_targets = torch.zeros_like(neg_batch[..., 0], device=device)
-
-                loss_pos = probe.compute_loss(
-                    pos_batch, pos_targets, mask=~zero_mask_pos
-                )
-                loss_neg = probe.compute_loss(
-                    neg_batch, neg_targets, mask=~zero_mask_neg
-                )
-
-                loss = (loss_pos + loss_neg) / n_grad_accum
-
-            # Backward pass and optimization step
-            loss.backward()
-            epoch_loss += loss.item() * n_grad_accum
-
-            if clip_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(probe.parameters(), clip_grad_norm)
-
-            if (i // batch_size + 1) % n_grad_accum == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-
-        # Perform an extra optimization step if the number of examples is not divisible by batch_size
-        if (n_examples // batch_size) % n_grad_accum != 0:
-            optimizer.step()
-            optimizer.zero_grad()
-        total_losses.append(epoch_loss)
-
-    probe.to("cpu")
-    return layer, probe, total_losses
-
-
-def cache_activations(encoder, examples, batch_size, max_length, cache_dir, **kwargs):
-    # Cache activations for a set of examples using the encoder
-    initial_padding_side = encoder.tokenizer.padding_side
-    encoder.tokenizer.padding_side = "right"  # Use right padding
-    activations = encoder.get_model_residual_acts(
-        examples,
-        batch_size=batch_size,
-        max_length=max_length,
-        use_memmap=cache_dir,
-        **kwargs,
-    )
-    encoder.tokenizer.padding_side = initial_padding_side
-    return activations
-
-
-def train_probe(
-    encoder,
-    positive_examples,
-    negative_examples,
-    create_probe_fn,
-    layers,
-    use_parallelism=False,
-    lr=1e-3,
-    max_length=1024,
-    n_epochs=10,
-    batch_size=16,
-    n_grad_accum=1,
-    device="cuda",
-    cache_activations_save_path=None,
-    pretrained_probes=None,
-    **kwargs,
-):
-    # Main function to train probes for all specified layers
-
-    # Check if the cache file exists and a save path is provided
-    if cache_activations_save_path is not None and os.path.exists(
-        cache_activations_save_path
-    ):
-        print(f"Loading cached activations from {cache_activations_save_path}")
-
-        positive_metadata_file = os.path.join(
-            cache_activations_save_path, "positive_examples_metadata.json"
-        )
-        negative_metadata_file = os.path.join(
-            cache_activations_save_path, "negative_examples_metadata.json"
-        )
-
-        # Load the memmaps for the positive examples
-        positive_activations = []
-        with open(positive_metadata_file, "r") as f:
-            positive_metadata = json.load(f)
-            for layer in range(positive_metadata["num_layers"]):
-                pos_file = os.path.join(
-                    cache_activations_save_path,
-                    f"positive_examples_residual_act_layer_{layer}.dat",
-                )
-                pos_memmap = np.memmap(
-                    pos_file,
-                    dtype=positive_metadata["dtype"],
-                    mode="r",
-                    shape=tuple(positive_metadata["shape"]),
-                )
-                positive_activations.append(pos_memmap)
-
-        # Load the memmaps for the negative examples
-        negative_activations = []
-        with open(negative_metadata_file, "r") as f:
-            negative_metadata = json.load(f)
-            for layer in range(negative_metadata["num_layers"]):
-                neg_file = os.path.join(
-                    cache_activations_save_path,
-                    f"negative_examples_residual_act_layer_{layer}.dat",
-                )
-                neg_memmap = np.memmap(
-                    neg_file,
-                    dtype=negative_metadata["dtype"],
-                    mode="r",
-                    shape=tuple(negative_metadata["shape"]),
-                )
-                negative_activations.append(neg_memmap)
-
-    else:
-        # Cache activations for the positive and negative examples
-        print("Caching activations...")
-
-        # Cache activations for the positive and negative examples, without memmaps
-        if cache_activations_save_path is None:
-            positive_activations = cache_activations(
-                encoder,
-                positive_examples,
-                batch_size,
-                max_length,
-                cache_dir=None,
-                **kwargs,
-            )
-            negative_activations = cache_activations(
-                encoder,
-                negative_examples,
-                batch_size,
-                max_length,
-                cache_dir=None,
-                **kwargs,
-            )
-
-        # Cache activations for the positive and negative examples, with memmaps
-        else:
-            positive_path = os.path.join(
-                cache_activations_save_path, "positive_examples"
-            )
-            negative_path = os.path.join(
-                cache_activations_save_path, "negative_examples"
-            )
-            positive_activations = cache_activations(
-                encoder,
-                positive_examples,
-                batch_size,
-                max_length,
-                cache_dir=positive_path,
-                **kwargs,
-            )
-            negative_activations = cache_activations(
-                encoder,
-                negative_examples,
-                batch_size,
-                max_length,
-                cache_dir=negative_path,
-                **kwargs,
-            )
-
-    # Move model to CPU and clear GPU memory, to save VRAM for probe training
-    encoder.model.to("cpu")
-    torch.cuda.empty_cache()
-
-    # Initialize probes and optimizers for each layer, and loss criterion
-    probes, optimizers = initialize_probes_and_optimizers(
-        layers, create_probe_fn, lr, device, pretrained_probes
-    )
-
-    # Train probes for all specified layers
-    print("Training probes...")
-    if use_parallelism:
-        # Use multiprocessing to train probes in parallel
-        mp.set_start_method("spawn", force=True)
-        with mp.Pool(processes=len(layers)) as pool:
-            results = pool.starmap(
-                train_layer,
-                [
-                    (
-                        layer,
-                        probes[layer],
-                        optimizers[layer],
-                        positive_activations[layer],
-                        negative_activations[layer],
-                        n_epochs,
-                        batch_size,
-                        n_grad_accum,
-                        device,
-                        cache_activations_save_path is not None,
-                    )
-                    for layer in layers
-                ],
-            )
-    else:
-        # Train probes sequentially
-        results = [
-            train_layer(
-                layer,
-                probes[layer],
-                optimizers[layer],
-                positive_activations[layer],
-                negative_activations[layer],
-                n_epochs,
-                batch_size,
-                n_grad_accum,
-                device,
-                cache_activations_save_path is not None,
-            )
-            for layer in layers
-        ]
-
-    # Print final loss for each layer and return the trained probes
-    for layer, probe, losses in results:
-        probes[layer] = probe
-        print(f"Layer {layer} - Final Loss: {losses[-1]:.4f}")
-
-    # Move model back to GPU and return probes
-    encoder.model.to("cuda")
-    return probes
-
-
-def initialize_lora_adapter(encoder, layers, lora_params):
-    # Disable gradient computation for the encoder.model
-    for param in encoder.model.parameters():
-        param.requires_grad = False
-
-    # Unpack LoRA parameters
-    r = lora_params.get("r", 64)
-    alpha = lora_params.get("alpha", 128)
-    dropout = lora_params.get("dropout", 0.0)
-    bias = lora_params.get("bias", "none")
-    target_modules = lora_params.get(
-        "target_modules",
-        ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj"],
-    )
-
-    # Define LoRA Configuration
-    lora_config = LoraConfig(
-        r=r,
-        lora_alpha=alpha,
-        target_modules=target_modules,
-        lora_dropout=dropout,
-        bias=bias,
-        layers_to_transform=list(range(0, max(layers) + 1)),
-        task_type="CAUSAL_LM",
-    )
-
-    # Apply LoRA adapter to the model
-    lora_model = get_peft_model(encoder.model, lora_config)
-
-    return lora_model
-
-
-def disable_model_gradients(lora_model):
-    # Disables all model gradients
-    for param in lora_model.parameters():
-        param.requires_grad_(False)
-
-
-def enable_model_gradients(lora_model):
-    # Enables lora adapter gradients
-    n_layers = lora_model.config.num_hidden_layers
-    for i in range(n_layers):
-        for name, param in lora_model.get_submodule("base_model.model.model.layers")[
-            i
-        ].named_parameters():
-            if "lora_" in name:
-                param.requires_grad_(True)
 
 
 def train_online_probe(
@@ -415,7 +69,7 @@ def train_online_probe(
     pretrained_probes=None,
     only_return_on_tokens_between=None,
     only_choose_prompt_tokens_between=None,
-    only_probe_tokens_between=None,  # New parameter for probe mask
+    only_probe_tokens_between=None,  # mask for selecting which tokens to probe
     epsilon=10.0,
     adversary_lr=1e-3,
     pgd_iterations=32,
@@ -428,84 +82,33 @@ def train_online_probe(
     softprompt_evals_data={},
     **kwargs,
 ):
-    # Get model name from encoder
-    if hasattr(encoder, 'model_name'):
-        model_name = encoder.model_name
-    elif hasattr(encoder.model, 'config'):
-        model_name = encoder.model.config._name_or_path
-    else:
-        model_name = type(encoder.model).__name__
+    # trains probes on model activations with optional adversarial training and lora adapters
+    # if hasattr(encoder, 'model_name'):
+    #     model_name = encoder.model_name
+    # elif hasattr(encoder.model, 'config'):
+    #     model_name = encoder.model.config._name_or_path
+    # else:
+    #     model_name = type(encoder.model).__name__
 
-    # Extract probe type from create_probe_fn
-    probe_type = "linear" if "Linear" in create_probe_fn.__name__ else "nonlinear"
-
-    wandb.init(
-        project="obfuscated-activations",
-        config={
-            # Model metadata
-            "model": {
-                "name": model_name,
-                "num_layers": len(layers),
-                "layers_used": layers,
-            },
-            # Probe metadata
-            "probe": {
-                "type": probe_type,
-                "learning_rate": probe_lr,
-            },
-            # LoRA metadata
-            "lora": {
-                "enabled": use_lora_adapter,
-                "learning_rate": adapter_lr,
-                "params": lora_params,
-            },
-            # Training metadata
-            "training": {
-                "adversarial": adversarial_training,
-                "batch_size": batch_size,
-                "grad_accumulation_steps": n_grad_accum,
-                "max_steps": n_steps,
-                "kl_penalty": kl_penalty,
-                "max_sequence_length": max_length,
-            },
-            # Dataset metadata
-            "dataset": {
-                "num_positive_examples": len(positive_examples),
-                "num_negative_examples": len(negative_examples),
-            },
-            # Adversarial training params
-            "adversarial": {
-                "epsilon": epsilon,
-                "pgd_iterations": pgd_iterations,
-                "start_step": start_adv_training_at_step,
-                "adversary_lr": adversary_lr,
-                "freeze_probes": freeze_probes_during_adversarial_training,
-                "freeze_lora_warmup": freeze_lora_during_warmup,
-            },
-            # Masking configuration
-            "masking": {
-                "return_on_tokens": str(only_return_on_tokens_between),
-                "choose_prompt_tokens": str(only_choose_prompt_tokens_between),
-                "probe_tokens": str(only_probe_tokens_between),
-            },
-        },
-        tags=[
-            model_name,
-            probe_type,
-            "adversarial" if adversarial_training else "standard",
-            "lora" if use_lora_adapter else "no-lora"
-        ]
-    )
+    # probe_type = "linear" if "Linear" in create_probe_fn.__name__ else "nonlinear"
 
     assert n_grad_accum == 0 or n_steps % n_grad_accum == 0
 
-    # Initialize probes and optimizers for each layer
-    probes, optimizers = initialize_probes_and_optimizers(
-        layers, create_probe_fn, probe_lr, device, pretrained_probes
-    )
+    probes = {}
+    optimizers = {}
+    if pretrained_probes is not None:
+        print("Using pretrained probes...")
+        probes = pretrained_probes
+    else:
+        probes = {layer: create_probe_fn() for layer in layers}
+
+    optimizers = {
+        layer: torch.optim.AdamW(probe.parameters(), lr=probe_lr)
+        for layer, probe in probes.items()
+    }
+
     probes = {layer: probe.to(device) for layer, probe in probes.items()}
 
-    # Initialize LoRA adapter
     if use_lora_adapter:
         lora_model = initialize_lora_adapter(encoder, layers, lora_params)
         adapter_optimizer = torch.optim.AdamW(lora_model.parameters(), lr=adapter_lr)
@@ -513,7 +116,6 @@ def train_online_probe(
         lora_model = encoder.model
         adapter_optimizer = None
 
-    # Tokenize and prepare input data
     encoder.tokenizer.padding_side = "right"
     positive_tokens = encoder.tokenizer(
         positive_examples,
@@ -539,7 +141,6 @@ def train_online_probe(
 
     print("only_return_on_tokens_between=", only_return_on_tokens_between)
 
-    # Target mask - where we compute the main loss
     if only_return_on_tokens_between is not None:
         zero_positive_mask = get_valid_token_mask(
             positive_input_ids, only_return_on_tokens_between
@@ -556,7 +157,6 @@ def train_online_probe(
 
     print("only_probe_tokens_between=", only_probe_tokens_between)
 
-    # Probe mask - where we compute probe measurements
     if only_probe_tokens_between is not None:
         probe_positive_mask = get_valid_token_mask(
             positive_input_ids, only_probe_tokens_between
@@ -565,13 +165,11 @@ def train_online_probe(
             negative_input_ids, only_probe_tokens_between
         )
     else:
-        # If no probe mask specified, use the target mask
         probe_positive_mask = zero_positive_mask
         probe_negative_mask = zero_negative_mask
 
     print("only_choose_prompt_tokens_between=", only_choose_prompt_tokens_between)
 
-    # This is only relevant for adversarial training
     if only_choose_prompt_tokens_between is not None:
         assert adversarial_training
         pos_only_choose_mask = get_valid_token_mask(
@@ -603,15 +201,12 @@ def train_online_probe(
     pbar = tqdm(total=n_steps, desc="Training LORA+Probe")
 
     while continue_training_next_epoch:
-        # Shuffle the examples
         perm = torch.randperm(n_examples)
 
         for i in range(0, n_examples, batch_size):
-            # Check if the batch is the last one
             if i + batch_size > n_examples:
                 break
 
-            # Get the batch
             batch_perm = perm[i : i + batch_size]
             pos_batch_input_ids = positive_input_ids[batch_perm].to(device)
             pos_batch_attention_mask = positive_attention_mask[batch_perm].to(device)
@@ -619,7 +214,6 @@ def train_online_probe(
             neg_batch_attention_mask = negative_attention_mask[batch_perm].to(device)
             pos_batch_zero_mask = zero_positive_mask[batch_perm].to(device).bool()
             neg_batch_zero_mask = zero_negative_mask[batch_perm].to(device).bool()
-            # Get probe masks for the batch
             pos_batch_probe_mask = probe_positive_mask[batch_perm].to(device).bool()
             neg_batch_probe_mask = probe_negative_mask[batch_perm].to(device).bool()
 
@@ -641,10 +235,9 @@ def train_online_probe(
                     pos_only_choose_mask[batch_perm].to(device).bool()
                 )
 
-            # Forward pass on positive examples
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
                 if adversarial_training and current_step >= start_adv_training_at_step:
-                    # Print this out at the first adversarial training step
+
                     if current_step == start_adv_training_at_step:
                         print("FORMATTING EXAMPLES FOR ADVERSARIAL TRAINING")
                         print("This is the target mask:")
@@ -674,10 +267,8 @@ def train_online_probe(
                             )
                         )
 
-                    # Disable model gradients
                     disable_model_gradients(lora_model)
 
-                    # Run this eval to benchmark the effectiveness of universal soft prompts
                     if (
                         current_step - start_adv_training_at_step
                     ) % run_softprompt_eval_every == 0:
@@ -690,19 +281,11 @@ def train_online_probe(
                             **softprompt_evals_data,
                         )
 
-                        wandb.log({
-                            "eval/jailbreak_rate": results["jailbreak_rate"],
-                            "eval/avg_positive_score": results["avg_positive_score"],
-                            "eval/avg_negative_score": results["avg_negative_score"],
-                            "step": current_step,
-                        })
-
                         info["softprompt_evals"].append(results)
                         print("Jailbreak Success Rate:", results["jailbreak_rate"])
                         print("Average positive score:", results["avg_positive_score"])
                         print("Average negative score:", results["avg_negative_score"])
 
-                    # Train new attack from scratch against batch inputs
                     losses, wrappers = train_attack(
                         adv_tokens=pos_batch_input_ids,
                         prompt_mask=pos_batch_only_choose_mask,
@@ -722,7 +305,6 @@ def train_online_probe(
                     pgd_toward_loss = losses["toward"]
                     pgd_probe_loss = losses["probe"]
 
-                    # Enable model gradients on the lora adapter
                     enable_model_gradients(lora_model)
                 else:
                     pgd_toward_loss = (
@@ -742,21 +324,16 @@ def train_online_probe(
                     layer: pos_output.hidden_states[layer + 1] for layer in layers
                 }
 
-            # Compute the positive probe losses using probe mask
             pos_loss = 0
             for layer, probe in probes.items():
                 with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    # Make sure shapes line up:
                     print(f"[DEBUG] step={current_step} (POS) layer={layer}")
                     print("  pos_acts[layer] shape:", pos_acts[layer].shape)
                     print("  pos_batch_probe_mask shape:", pos_batch_probe_mask.shape)
-                    # You might also look at how many tokens are actually selected:
                     print("  probe_mask sum:", pos_batch_probe_mask.sum().item())
 
-                    # Potentially call probe.forward(...) separately so you can inspect logits:
                     logits = probe.forward(pos_acts[layer])
                     print("  logits shape:", logits.shape)
-                    # If it is not huge, also check min/max:
                     print("  logits min:", float(logits.min().item()),
                             " logits max:", float(logits.max().item()))
 
@@ -770,13 +347,11 @@ def train_online_probe(
                     )
                     pos_loss += pos_layer_loss
 
-            # Backward pass on positive examples
             pos_loss.backward(retain_graph=True)
 
             for wrapper in wrappers:
                 wrapper.enabled = False
 
-            # Forward pass on negative examples
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
                 neg_output = lora_model(
                     input_ids=neg_batch_input_ids,
@@ -787,7 +362,6 @@ def train_online_probe(
                     layer: neg_output.hidden_states[layer + 1] for layer in layers
                 }
 
-            # Compute the negative probe losses using probe mask
             neg_loss = 0
             for layer, probe in probes.items():
                 with torch.autocast(device_type=device, dtype=torch.bfloat16):
@@ -810,10 +384,9 @@ def train_online_probe(
                     )
                     neg_loss += neg_layer_loss
 
-            # Backward pass on negative examples
             neg_loss.backward(retain_graph=True)
 
-            # Compute KL divergence of logits from base model logits
+            # KL divergence of logits from base model logits
             with torch.no_grad():
                 lora_model.disable_adapter_layers()
                 base_neg_output = lora_model(
@@ -822,7 +395,6 @@ def train_online_probe(
                 )
                 lora_model.enable_adapter_layers()
 
-            # Get logits only for masked positions
             base_logits = base_neg_output.logits[neg_batch_zero_mask]
             model_logits = neg_logits[neg_batch_zero_mask]
 
@@ -844,12 +416,10 @@ def train_online_probe(
             accumulated_probe_pgd_loss += pgd_probe_loss if adversarial_training else 0
             steps_since_last_log += 1
 
-            # Perform optimization step after accumulating gradients
             if (i // batch_size + 1) % n_grad_accum == 0 or (
                 i + batch_size
             ) >= n_examples:
 
-                # Clip the gradients if specified
                 if clip_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(
                         lora_model.parameters(), clip_grad_norm
@@ -861,7 +431,6 @@ def train_online_probe(
                     ]
                     torch.nn.utils.clip_grad_norm_(all_probe_params, clip_grad_norm)
 
-                # Optimize probes only when not using adversarial training
                 if not freeze_probes_during_adversarial_training or not (
                     adversarial_training and current_step > start_adv_training_at_step
                 ):
@@ -869,7 +438,6 @@ def train_online_probe(
                         optimizer.step()
                         optimizer.zero_grad()
 
-                # Optimize the adapter
                 if not freeze_lora_during_warmup or not (
                     adversarial_training and current_step < start_adv_training_at_step
                 ):
@@ -923,7 +491,6 @@ def train_online_probe(
 
                 print(log_message)
 
-                # Reset accumulators
                 accumulated_toward_pgd_loss = 0
                 accumulated_probe_pgd_loss = 0
                 accumulated_probe_loss = 0
@@ -937,14 +504,6 @@ def train_online_probe(
             pbar.update(1)  # Update progress bar
 
     try:
-        # At the end, log final metrics to summary
-        wandb.run.summary.update({
-            "final_probe_loss": avg_probe_loss,
-            "final_kl_loss": avg_kl_loss,
-            "final_total_loss": avg_total_loss,
-            "training_duration": time.time() - start_time,
-        })
-
         if adversarial_training:
             wandb.run.summary.update({
                 "final_pgd_toward_loss": avg_toward_pgd_loss,
@@ -953,15 +512,59 @@ def train_online_probe(
     except Exception as e:
         print("oops, problem with unbound variables")
 
-    wandb.finish()
     return probes, lora_model, info
 
 
 def save_probes(probes, save_path):
-    # Save a list of probes to a file
+    # saves trained probes to disk
     torch.save(probes, save_path)
 
 
 def load_probes(load_path):
-    # Load a list of probes from a file
+    # loads probes from disk
     return torch.load(load_path, weights_only=False)
+
+
+def initialize_lora_adapter(encoder, layers, lora_params):
+    # initializes lora adapter for parameter-efficient fine-tuning
+    # freezes base model parameters and adds trainable lora layers
+    for param in encoder.model.parameters():
+        param.requires_grad = False
+
+    r = lora_params.get("r", 64)
+    alpha = lora_params.get("alpha", 128)
+    dropout = lora_params.get("dropout", 0.0)
+    bias = lora_params.get("bias", "none")
+    target_modules = lora_params.get(
+        "target_modules",
+        ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj"],
+    )
+
+    lora_config = LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        target_modules=target_modules,
+        lora_dropout=dropout,
+        bias=bias,
+        layers_to_transform=list(range(0, max(layers) + 1)),
+        task_type="CAUSAL_LM",
+    )
+
+    lora_model = get_peft_model(encoder.model, lora_config)
+
+    return lora_model
+
+
+def disable_model_gradients(lora_model):
+    for param in lora_model.parameters():
+        param.requires_grad_(False)
+
+
+def enable_model_gradients(lora_model):
+    n_layers = lora_model.config.num_hidden_layers
+    for i in range(n_layers):
+        for name, param in lora_model.get_submodule("base_model.model.model.layers")[
+            i
+        ].named_parameters():
+            if "lora_" in name:
+                param.requires_grad_(True)
